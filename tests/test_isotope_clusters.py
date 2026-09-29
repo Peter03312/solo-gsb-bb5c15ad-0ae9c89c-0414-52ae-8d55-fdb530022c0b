@@ -1,5 +1,7 @@
 """Tests for de novo isotope-cluster detection and its API endpoint."""
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -162,6 +164,74 @@ def test_all_zero_intensities_allowed():
     result = detect_isotope_clusters(peaks, (1, 1), 0.005, 3)
     assert len(result.clusters) == 1
     assert result.clusters[0].score == pytest.approx(0.0)
+
+
+def _dense_grid_peaks(columns: int, rows: int, jitter: float = 0.001):
+    # ``rows`` peaks per nominal isotope position; from any peak the later
+    # rows of the next column are legal one-step successors, so the number
+    # of near-degenerate chains grows exponentially with ``columns``.
+    peaks = []
+    for g in range(columns):
+        for j in range(rows):
+            peaks.append((100.0 + g * NEUTRON_STEP_DA + j * jitter, 100.0))
+    return peaks
+
+
+def test_dense_short_ladder_is_pruned_without_enumeration():
+    # Regression: the longest legal ladder has 12 members but min_peaks is
+    # 13. No chain can qualify, yet the unpruned DFS explored the full
+    # exponential forest of short chains (effectively hung). The optimistic
+    # continuation bound must cut every start immediately.
+    peaks = _dense_grid_peaks(columns=12, rows=4)
+    assert len(peaks) == 48
+    started = time.perf_counter()
+    result = detect_isotope_clusters(peaks, (1, 1), 0.01, 13)
+    assert time.perf_counter() - started < 2.0
+    assert result.clusters == ()
+    assert result.unassigned_indices == tuple(range(48))
+
+
+def test_pruning_does_not_drop_gap_qualified_chain():
+    # The bound must count a two-step continuation when the gap is still
+    # available: positions 0, [1 missing], 2, 3 give 4 observed members.
+    step = NEUTRON_STEP_DA
+    peaks = [
+        (100.0, 100.0),
+        (100.0 + 2 * step, 60.0),
+        (100.0 + 3 * step, 10.0),
+        (100.0 + 4 * step, 2.0),
+    ]
+    result = detect_isotope_clusters(peaks, (1, 1), 0.005, 4)
+    assert len(result.clusters) == 1
+    assert result.clusters[0].member_indices == (0, 1, 2, 3)
+    assert result.clusters[0].missing_positions == (1,)
+
+
+def test_pruning_does_not_drop_one_step_after_gap_chain():
+    # The "gap already used" bound must still count one-step continuations:
+    # positions 0, 2, 3, 4 give 4 observed members via one gap then steps.
+    step = NEUTRON_STEP_DA
+    peaks = [
+        (100.0, 100.0),
+        (100.0 + 2 * step, 60.0),
+        (100.0 + 3 * step, 10.0),
+        (100.0 + 4 * step, 2.0),
+        (100.0 + 5 * step, 1.0),
+    ]
+    result = detect_isotope_clusters(peaks, (1, 1), 0.005, 5)
+    assert result.clusters[0].member_indices == (0, 1, 2, 3, 4)
+    assert result.clusters[0].missing_positions == (1,)
+
+
+def test_dense_ladder_just_below_min_peaks_pruned():
+    # 11-member ladder with min_peaks 12: same exponential forest, zero
+    # qualifying chains, must stay fast.
+    peaks = _dense_grid_peaks(columns=11, rows=4)
+    started = time.perf_counter()
+    result = detect_isotope_clusters(peaks, (1, 1), 0.01, 12)
+    assert time.perf_counter() - started < 2.0
+    assert result.clusters == ()
+    assert result.unassigned_indices == tuple(range(44))
 
 
 # --- API endpoint -----------------------------------------------------------
@@ -346,3 +416,54 @@ def test_endpoint_charge_range_limit(client):
     resp = client.post("/api/v1/isotope-clusters", json=payload)
     assert resp.status_code == 200
     assert resp.json()["clusters"][0]["charge"] == 2
+
+
+def test_endpoint_dense_short_ladder_empty_and_fast(client):
+    # The documented 48-peak reproduction: 12 nominal positions x 4 peaks
+    # each (mz = 100 + g*1.003354835 + j*0.001), charge 1 only, tol 0.01,
+    # min_peaks 13. No chain can have 13 members; pruning must answer 200
+    # with empty clusters and every index unassigned without exploring the
+    # exponential forest of short chains.
+    peaks = [
+        {"mz": 100.0 + g * NEUTRON_STEP_DA + j * 0.001, "intensity": 100.0}
+        for g in range(12)
+        for j in range(4)
+    ]
+    payload = {
+        "peaks": peaks,
+        "min_charge": 1,
+        "max_charge": 1,
+        "spacing_tolerance": 0.01,
+        "min_peaks": 13,
+    }
+    started = time.perf_counter()
+    resp = client.post("/api/v1/isotope-clusters", json=payload)
+    assert time.perf_counter() - started < 2.0
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["peak_count"] == 48
+    assert body["cluster_count"] == 0
+    assert body["clusters"] == []
+    assert body["unassigned_peaks"] == list(range(48))
+    # Existing request/response fields stay in place.
+    assert body["min_charge"] == 1
+    assert body["max_charge"] == 1
+    assert body["spacing_tolerance"] == 0.01
+    assert body["min_peaks"] == 13
+
+
+def test_endpoint_candidate_budget_still_422(client, monkeypatch):
+    # A dense grid whose chains *do* qualify must still hit the candidate
+    # cap; shrink the budget to keep the test quick. The response shape is
+    # the existing error envelope with field=spacing_tolerance.
+    import app.isotope_clusters as mod
+
+    monkeypatch.setattr(mod, "MAX_CANDIDATES", 500)
+    peaks = _dense_grid_peaks(columns=30, rows=4, jitter=0.0008)
+    payload = _cluster_payload(peaks, min_charge=1, max_charge=1, tol=0.01)
+    resp = client.post("/api/v1/isotope-clusters", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "too_many_candidates"
+    assert detail["field"] == "spacing_tolerance"
+    assert "500" in detail["message"]

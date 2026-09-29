@@ -11,6 +11,14 @@ mass difference split over *z* charges). For every charge in a requested
 * a two-step jump means exactly one isotope position is missing, and each
   candidate chain may contain at most one such gap.
 
+Before the depth-first growth, the longest extendable suffix length is
+precomputed per peak (separately for "gap still available" and "gap already
+used") straight from the same legal-successor windows. A branch whose
+current member count plus that optimistic extension is below ``min_peaks``
+cannot ever yield a qualifying chain and is pruned at once, so spectra
+without any ladder long enough (e.g. dense near-degenerate peak grids) are
+answered without enumerating an exponential forest of too-short chains.
+
 Observed intensities are normalised to the spectrum base peak (100). A
 candidate's score is the sum of its member intensities minus 10 per missing
 isotope position. A weighted-interval dynamic program then chooses the
@@ -103,6 +111,16 @@ def _grow_candidates_for_charge(
     ``min_peaks`` members and may carry at most one two-step gap. Chains that
     only differ by the route taken to the same member sequence are merged
     (the missing position is then identical).
+
+    Hopeless branches are pruned with an optimistic bound. The legal
+    successors of every peak are precomputed once via the same bisect
+    windows the depth-first walk uses; ``longest_gap_left[i]``
+    (``longest_gap_used[i]``) is the maximum number of *further* members
+    reachable after peak ``i`` while a two-step gap is still available
+    (already consumed). If the current member count plus that bound is below
+    ``min_peaks`` no extension of the branch can qualify, so the branch is
+    abandoned before it is explored -- this never drops a valid chain
+    because the bound is exactly the walk's own longest legal continuation.
     """
     step = NEUTRON_STEP_DA / charge
     candidates: list[ClusterCandidate] = []
@@ -110,6 +128,47 @@ def _grow_candidates_for_charge(
     # identical membership entering the same window twice.
     seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
     n = len(mz)
+
+    # Legal one- and two-step successors of each peak, as index ranges
+    # within the sorted m/z list. Shared by the bound precomputation and
+    # the depth-first walk so the optimistic bound matches the walk exactly.
+    one_step: list[tuple[int, int]] = [(0, 0)] * n
+    two_step: list[tuple[int, int]] = [(0, 0)] * n
+    for i in range(n):
+        expected = mz[i] + step
+        lo = bisect_left(mz, expected - spacing_tolerance, lo=i + 1)
+        one_step[i] = (lo, bisect_right(mz, expected + spacing_tolerance, lo=lo))
+        expected = mz[i] + 2.0 * step
+        lo = bisect_left(mz, expected - spacing_tolerance, lo=i + 1)
+        two_step[i] = (lo, bisect_right(mz, expected + spacing_tolerance, lo=lo))
+
+    # Longest continuation (number of additional members) from peak i:
+    #   longest_gap_left[i]: the two-step option is still available;
+    #   longest_gap_used[i]: only one-step successors may follow.
+    # Computed right to left because every successor has a larger index.
+    longest_gap_used = [0] * n
+    longest_gap_left = [0] * n
+    for i in range(n - 1, -1, -1):
+        lo, hi = one_step[i]
+        best_used = 0
+        best_left = 0
+        for nxt in range(lo, hi):
+            # A one-step move leaves the gap budget unchanged.
+            reach_used = 1 + longest_gap_used[nxt]
+            if reach_used > best_used:
+                best_used = reach_used
+            reach_left = 1 + longest_gap_left[nxt]
+            if reach_left > best_left:
+                best_left = reach_left
+        longest_gap_used[i] = best_used
+
+        lo, hi = two_step[i]
+        for nxt in range(lo, hi):
+            # Taking the two-step gap here consumes it for the rest.
+            reach_left = 1 + longest_gap_used[nxt]
+            if reach_left > best_left:
+                best_left = reach_left
+        longest_gap_left[i] = best_left
 
     def check_budget() -> None:
         if budget[0] < 0:
@@ -148,15 +207,20 @@ def _grow_candidates_for_charge(
         intensity_sum: float,
         nominal: int,
     ) -> None:
+        # Optimistic pruning: even the longest legal continuation of this
+        # tail cannot lift the chain to min_peaks members, so neither this
+        # prefix nor any extension of it can ever qualify.
+        reach = longest_gap_used[tail] if gap_used else longest_gap_left[tail]
+        if len(members) + reach < min_peaks:
+            return
         check_budget()
         if len(members) >= min_peaks:
             record(members, missing, intensity_sum)
-        mz_tail = mz[tail]
-        deltas = (1, 2) if not gap_used else (1,)
-        for delta in deltas:
-            expected = mz_tail + delta * step
-            lo = bisect_left(mz, expected - spacing_tolerance, lo=tail + 1)
-            hi = bisect_right(mz, expected + spacing_tolerance, lo=lo)
+        if gap_used:
+            moves = ((one_step[tail], 1),)
+        else:
+            moves = ((one_step[tail], 1), (two_step[tail], 2))
+        for (lo, hi), delta in moves:
             for nxt in range(lo, hi):
                 members.append(nxt)
                 if delta == 2:
