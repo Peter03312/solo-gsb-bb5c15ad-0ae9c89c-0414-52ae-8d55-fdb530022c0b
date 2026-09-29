@@ -87,6 +87,66 @@ class ClusterDetectionResult:
     unassigned_indices: tuple[int, ...]
 
 
+def _successor_windows(
+    mz: list[float], step: float, spacing_tolerance: float
+) -> tuple[list[list[int]], list[list[int]]]:
+    """For every peak, the peaks one or two nominal steps ahead, in windows.
+
+    ``one_step[i]``/``two_step[i]`` hold the peak indices reachable from
+    peak ``i`` with a delta of 1/2 within ``spacing_tolerance``. Both lists
+    are sorted and disjoint.
+    """
+    n = len(mz)
+    one_step: list[list[int]] = [[] for _ in range(n)]
+    two_step: list[list[int]] = [[] for _ in range(n)]
+    for i, mz_tail in enumerate(mz):
+        lo = bisect_left(mz, mz_tail + step - spacing_tolerance, lo=i + 1)
+        hi = bisect_right(mz, mz_tail + step + spacing_tolerance, lo=lo)
+        one_step[i] = list(range(lo, hi))
+        lo = bisect_left(mz, mz_tail + 2 * step - spacing_tolerance, lo=i + 1)
+        hi = bisect_right(mz, mz_tail + 2 * step + spacing_tolerance, lo=lo)
+        two_step[i] = list(range(lo, hi))
+    return one_step, two_step
+
+
+def _reachable_lengths(
+    one_step: list[list[int]], two_step: list[list[int]]
+) -> tuple[list[int], list[int]]:
+    """Longest appendable suffix length per tail, keyed by gap availability.
+
+    ``reachable_gap_free[i]`` is the number of *additional* members the
+    longest legal chain starting at peak ``i`` can still gain when no
+    two-step jump may ever be used; ``reachable_gap_open[i]`` is the same
+    quantity when one two-step jump is still available (it may remain
+    unused). Successors always have larger peak indices, so a reverse
+    sweep evaluates them first.
+    """
+    n = len(one_step)
+    reachable_gap_free = [0] * n
+    reachable_gap_open = [0] * n
+    for i in range(n - 1, -1, -1):
+        best_free = 0
+        for nxt in one_step[i]:
+            candidate = 1 + reachable_gap_free[nxt]
+            if candidate > best_free:
+                best_free = candidate
+        reachable_gap_free[i] = best_free
+
+        best_open = best_free
+        for nxt in two_step[i]:
+            # Taking the two-step jump spends the single available gap, so
+            # every later step must be a one-step jump.
+            candidate = 1 + reachable_gap_free[nxt]
+            if candidate > best_open:
+                best_open = candidate
+        for nxt in one_step[i]:
+            candidate = 1 + reachable_gap_open[nxt]
+            if candidate > best_open:
+                best_open = candidate
+        reachable_gap_open[i] = best_open
+    return reachable_gap_free, reachable_gap_open
+
+
 def _grow_candidates_for_charge(
     mz: list[float],
     intensity: list[float],
@@ -95,7 +155,7 @@ def _grow_candidates_for_charge(
     min_peaks: int,
     budget: list[int],
 ) -> list[ClusterCandidate]:
-    """Enumerate every valid chain at ``charge`` via depth-first growth.
+    """Enumerate every qualifying chain at ``charge`` via depth-first growth.
 
     Each starting peak is a potential monoisotopic member. From the current
     tail a successor may be one or two nominal steps away (within
@@ -103,6 +163,15 @@ def _grow_candidates_for_charge(
     ``min_peaks`` members and may carry at most one two-step gap. Chains that
     only differ by the route taken to the same member sequence are merged
     (the missing position is then identical).
+
+    Before growing, the successor windows and the longest suffix still
+    reachable from every tail (with and without the two-step gap available)
+    are precomputed in reverse index order. A prefix is pruned as soon as
+    ``current members + reachable additional members < min_peaks``: it can
+    never produce a qualifying candidate, so the bound loses no valid
+    candidate while avoiding exhaustive enumeration of hopeless short
+    chains (which the record budget alone cannot bound, since it is only
+    charged by candidates that already meet ``min_peaks``).
     """
     step = NEUTRON_STEP_DA / charge
     candidates: list[ClusterCandidate] = []
@@ -110,6 +179,10 @@ def _grow_candidates_for_charge(
     # identical membership entering the same window twice.
     seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
     n = len(mz)
+    one_step, two_step = _successor_windows(mz, step, spacing_tolerance)
+    reachable_gap_free, reachable_gap_open = _reachable_lengths(
+        one_step, two_step
+    )
 
     def check_budget() -> None:
         if budget[0] < 0:
@@ -149,15 +222,19 @@ def _grow_candidates_for_charge(
         nominal: int,
     ) -> None:
         check_budget()
+        reachable_extra = (
+            reachable_gap_free[tail] if gap_used else reachable_gap_open[tail]
+        )
+        if len(members) + reachable_extra < min_peaks:
+            return
         if len(members) >= min_peaks:
             record(members, missing, intensity_sum)
-        mz_tail = mz[tail]
-        deltas = (1, 2) if not gap_used else (1,)
-        for delta in deltas:
-            expected = mz_tail + delta * step
-            lo = bisect_left(mz, expected - spacing_tolerance, lo=tail + 1)
-            hi = bisect_right(mz, expected + spacing_tolerance, lo=lo)
-            for nxt in range(lo, hi):
+        if gap_used:
+            windows = ((one_step[tail], 1),)
+        else:
+            windows = ((one_step[tail], 1), (two_step[tail], 2))
+        for window, delta in windows:
+            for nxt in window:
                 members.append(nxt)
                 if delta == 2:
                     missing.append(nominal + 1)
@@ -174,6 +251,8 @@ def _grow_candidates_for_charge(
                     missing.pop()
 
     for start in range(n):
+        if 1 + reachable_gap_open[start] < min_peaks:
+            continue
         dfs(start, [start], [], False, intensity[start], 0)
     return candidates
 

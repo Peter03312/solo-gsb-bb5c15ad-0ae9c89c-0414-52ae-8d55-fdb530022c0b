@@ -1,5 +1,7 @@
 """Tests for de novo isotope-cluster detection and its API endpoint."""
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -164,6 +166,66 @@ def test_all_zero_intensities_allowed():
     assert result.clusters[0].score == pytest.approx(0.0)
 
 
+def _short_chain_grid():
+    # 48 peaks on a 12 (isotope rows) x 4 (jittered columns) grid: four
+    # peaks sit inside every ~1.00335 successor window, so naive growth
+    # explores ~4**k prefixes even though no chain can span 12 rows, i.e.
+    # can never reach min_peaks = 13.
+    return [
+        (100.0 + g * NEUTRON_STEP_DA + j * 0.001, 100.0)
+        for g in range(12)
+        for j in range(4)
+    ]
+
+
+def test_short_chains_below_min_peaks_pruned_without_enumeration():
+    peaks = _short_chain_grid()
+    assert len(peaks) == 48
+    start = time.perf_counter()
+    result = detect_isotope_clusters(peaks, (1, 1), 0.01, 13)
+    elapsed = time.perf_counter() - start
+    assert result.clusters == ()
+    assert result.unassigned_indices == tuple(range(48))
+    # The reachability-bound pruning must make this a quick lookup rather
+    # than an exponential walk over hopeless short prefixes.
+    assert elapsed < 2.0
+
+
+def test_longest_reachable_chain_not_over_pruned():
+    # A second grid with 12 rows and two peaks per row: a tight tolerance
+    # admits exactly one successor per row, so a 12-member chain exists.
+    # min_peaks = 12 must still find it, proving the reachability bound
+    # only cuts prefixes that truly cannot grow to the threshold.
+    peaks = [
+        (100.0 + g * NEUTRON_STEP_DA + j * 0.001, 100.0)
+        for g in range(12)
+        for j in range(2)
+    ]
+    result = detect_isotope_clusters(peaks, (1, 1), 0.0005, 12)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert len(cluster.member_indices) == 12
+    assert cluster.missing_positions == ()
+    assert cluster.member_indices == tuple(range(0, 24, 2))
+    # The offset column is never part of the chosen cluster.
+    assert result.unassigned_indices == tuple(range(1, 24, 2))
+
+
+def test_two_step_gap_counts_toward_reachable_length():
+    # Eleven observed rows with one nominal position missing in the middle
+    # span 12 nominal positions via a single two-step jump; the bound must
+    # count that jump so an 11-member chain survives min_peaks = 11.
+    step = NEUTRON_STEP_DA
+    positions = [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11]
+    peaks = [(100.0 + p * step, 100.0) for p in positions]
+    result = detect_isotope_clusters(peaks, (1, 1), 0.005, 11)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert cluster.member_indices == tuple(range(11))
+    assert cluster.missing_positions == (3,)
+    assert result.unassigned_indices == ()
+
+
 # --- API endpoint -----------------------------------------------------------
 
 def test_endpoint_single_cluster(client):
@@ -325,6 +387,45 @@ def test_endpoint_charge_tie_prefers_lower_charge(client):
     resp = client.post("/api/v1/isotope-clusters", json=payload)
     assert resp.status_code == 200
     assert resp.json()["clusters"][0]["charge"] == 1
+
+
+def test_endpoint_short_chains_below_min_peaks_empty_fast(client):
+    # 48 peaks on a 12 x 4 grid where no chain reaches min_peaks = 13;
+    # the endpoint must answer 200 with an empty cluster set and every
+    # peak unassigned without exhaustively enumerating short prefixes.
+    peaks = [
+        (100.0 + g * NEUTRON_STEP_DA + j * 0.001, 100.0)
+        for g in range(12)
+        for j in range(4)
+    ]
+    payload = _cluster_payload(
+        peaks, min_charge=1, max_charge=1, tol=0.01, min_peaks=13
+    )
+    start = time.perf_counter()
+    resp = client.post("/api/v1/isotope-clusters", json=payload)
+    elapsed = time.perf_counter() - start
+    assert resp.status_code == 200, resp.text
+    assert elapsed < 2.0
+    body = resp.json()
+    assert body["peak_count"] == 48
+    assert body["cluster_count"] == 0
+    assert body["clusters"] == []
+    assert body["unassigned_peaks"] == list(range(48))
+
+
+def test_endpoint_too_many_candidates_422(client):
+    # Peaks 0.5 Da apart with a loose tolerance make every successor
+    # window branch several ways; once more than 100,000 qualifying
+    # candidates accumulate the search aborts with the documented 422.
+    peaks = [(100.0 + 0.5 * i, 100.0) for i in range(200)]
+    payload = _cluster_payload(
+        peaks, min_charge=1, max_charge=1, tol=0.6, min_peaks=2
+    )
+    resp = client.post("/api/v1/isotope-clusters", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "too_many_candidates"
+    assert detail["field"] == "spacing_tolerance"
 
 
 def test_endpoint_charge_range_limit(client):
